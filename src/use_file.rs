@@ -5,7 +5,7 @@ use crate::{
 };
 use core::{
     cell::UnsafeCell,
-    ffi::c_void,
+    ffi::{c_void, CStr},
     mem::MaybeUninit,
     sync::atomic::{AtomicUsize, Ordering::Relaxed},
 };
@@ -16,7 +16,7 @@ use core::{
 ///   - On Redox, only /dev/urandom is provided.
 ///   - On AIX, /dev/urandom will "provide cryptographically secure output".
 ///   - On Haiku and QNX Neutrino they are identical.
-const FILE_PATH: cstr::Ref = cstr::unwrap_const_from_bytes_with_nul(b"/dev/urandom\0");
+const FILE_PATH: &'static CStr = cstr::unwrap_const_from_bytes_with_nul(b"/dev/urandom\0");
 const FD_UNINIT: usize = usize::max_value();
 
 pub fn getrandom_inner(dest: &mut [MaybeUninit<u8>]) -> Result<(), Error> {
@@ -68,7 +68,7 @@ fn get_rng_fd() -> Result<libc::c_int, Error> {
 // Succeeds once /dev/urandom is safe to read from
 #[cfg(any(target_os = "android", target_os = "linux"))]
 fn wait_until_rng_ready() -> Result<(), Error> {
-    const DEV_RANDOM: cstr::Ref = cstr::unwrap_const_from_bytes_with_nul(b"/dev/random\0");
+    const DEV_RANDOM: &'static CStr = cstr::unwrap_const_from_bytes_with_nul(b"/dev/random\0");
     // Poll /dev/random to make sure it is ok to read from /dev/urandom.
     let fd = open_readonly(DEV_RANDOM)?;
     let mut pfd = libc::pollfd {

@@ -3,7 +3,11 @@ use crate::{
     util_libc::{cstr, sys_fill_exact, Weak},
     Error,
 };
-use core::{ffi::c_void, mem::MaybeUninit, ptr};
+use core::{
+    ffi::{c_void, CStr},
+    mem::MaybeUninit,
+    ptr,
+};
 
 fn kern_arnd(buf: &mut [MaybeUninit<u8>]) -> libc::ssize_t {
     static MIB: [libc::c_int; 2] = [libc::CTL_KERN, libc::KERN_ARND];
@@ -29,7 +33,7 @@ type GetRandomFn = unsafe extern "C" fn(*mut u8, libc::size_t, libc::c_uint) -> 
 
 pub fn getrandom_inner(dest: &mut [MaybeUninit<u8>]) -> Result<(), Error> {
     // getrandom(2) was introduced in NetBSD 10.0
-    static GETRANDOM_NAME: cstr::Ref = cstr::unwrap_const_from_bytes_with_nul(b"getrandom\0");
+    static GETRANDOM_NAME: &'static CStr = cstr::unwrap_const_from_bytes_with_nul(b"getrandom\0");
     static GETRANDOM: Weak = Weak::new(GETRANDOM_NAME);
     if let Some(fptr) = GETRANDOM.ptr() {
         let func: GetRandomFn = unsafe { core::mem::transmute(fptr) };

@@ -1,12 +1,12 @@
 #![allow(dead_code)]
 use crate::Error;
 use core::{
+    ffi::{c_void, CStr},
     mem::MaybeUninit,
     num::NonZeroU32,
     ptr::NonNull,
     sync::atomic::{fence, AtomicPtr, Ordering},
 };
-use libc::c_void;
 
 #[path = "util_cstr.rs"]
 pub(crate) mod cstr;
@@ -85,7 +85,7 @@ pub fn sys_fill_exact(
 // https://github.com/rust-lang/rust/blob/1.61.0/library/std/src/sys/unix/weak.rs#L84
 // except that the caller must manually cast self.ptr() to a function pointer.
 pub struct Weak {
-    name: cstr::Ref,
+    name: &'static CStr,
     addr: AtomicPtr<c_void>,
 }
 
@@ -99,7 +99,7 @@ impl Weak {
     const UNINIT: *mut c_void = 1 as *mut c_void;
 
     // Construct a binding to a C function with a given name.
-    pub const fn new(name: cstr::Ref) -> Self {
+    pub const fn new(name: &'static CStr) -> Self {
         Self {
             name,
             addr: AtomicPtr::new(Self::UNINIT),
@@ -136,7 +136,7 @@ impl Weak {
 
 // Memory leak hazard: The returned file descriptor must be manually closed to
 // avoid a file descriptor leak.
-pub fn open_readonly(path: cstr::Ref) -> Result<libc::c_int, Error> {
+pub fn open_readonly(path: &'static CStr) -> Result<libc::c_int, Error> {
     loop {
         let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
         if fd >= 0 {
