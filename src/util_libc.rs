@@ -103,12 +103,35 @@ pub fn open_readonly(path: &[u8]) -> Result<libc::c_int, Error> {
 /// Thin wrapper around the `getrandom()` Linux system call
 #[cfg(any(target_os = "android", target_os = "linux"))]
 pub fn getrandom_syscall(buf: &mut [MaybeUninit<u8>]) -> libc::ssize_t {
-    unsafe {
-        libc::syscall(
-            libc::SYS_getrandom,
-            buf.as_mut_ptr().cast::<core::ffi::c_void>(),
-            buf.len(),
-            0,
-        ) as libc::ssize_t
-    }
+    // Rust requires object to be smaller than `isize::MAX` bytes, so there is
+    // no real truncation here, even when running
+    debug_assert!(buf.len() <= isize::MAX.unsigned_abs());
+
+    // pointers can be passed to libc::syscall.
+    const _: () = assert!(
+        core::mem::size_of::<libc::c_long>() == core::mem::size_of::<*mut core::ffi::c_void>()
+    );
+    let ptr = buf.as_mut_ptr().cast::<core::ffi::c_void>();
+
+    // usize values can be passed to libc::syscall.
+    const _: () =
+        assert!(core::mem::size_of::<libc::c_long>() == core::mem::size_of::<libc::ssize_t>());
+    let len: usize = buf.len();
+
+    const ZERO: libc::c_ulong = 0;
+
+    // Note that the `libc` crate adds `__X32_SYSCALL_BIT` for x32 targets.
+
+    let res: libc::c_long = unsafe { libc::syscall(libc::SYS_getrandom, ptr, len, ZERO) };
+
+    // c_long to ssize_t conversion is lossless.
+    const _: () =
+        assert!(core::mem::size_of::<libc::c_long>() == core::mem::size_of::<libc::ssize_t>());
+    #[allow(clippy::cast_possible_truncation)]
+    let res = res as libc::ssize_t;
+
+    // Rust requires object to be smaller than `isize::MAX` bytes.
+    debug_assert!(libc::ssize_t::try_from(buf.len()).is_ok());
+
+    res
 }
