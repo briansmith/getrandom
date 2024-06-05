@@ -4,7 +4,6 @@ extern crate std;
 
 use crate::{util_libc::sys_fill_exact, Error};
 use core::{
-    cell::UnsafeCell,
     ffi::c_void,
     mem::MaybeUninit,
     sync::atomic::{AtomicI32, Ordering},
@@ -14,6 +13,7 @@ use std::{
     io,
     // TODO(MSRV 1.66): use `std::os::fd` instead of `std::unix::io`.
     os::unix::io::{AsRawFd as _, BorrowedFd, IntoRawFd as _, RawFd},
+    sync::{Mutex, PoisonError},
 };
 
 /// For all platforms, we use `/dev/urandom` rather than `/dev/random`.
@@ -70,9 +70,16 @@ fn get_rng_fd() -> Result<BorrowedFd<'static>, Error> {
         // descriptors concurrently, which could run into the limit on the
         // number of open file descriptors. Our goal is to have no more than one
         // file descriptor open, ever.
-        static MUTEX: Mutex = Mutex::new();
-        unsafe { MUTEX.lock() };
-        let _guard = DropGuard(|| unsafe { MUTEX.unlock() });
+        //
+        // We assume any call to `Mutex::lock` synchronizes-with
+        // (Ordering::Acquire) the preceding dropping of a `MutexGuard` that
+        // unlocks the mutex (Ordering::Release) and that `Mutex` doesn't have
+        // any special treatment for what's "inside" the mutex (the `T` in
+        // `Mutex<T>`). See `https://github.com/rust-lang/rust/issues/126239.
+        static MUTEX: Mutex<()> = Mutex::new(());
+        let _guard = MUTEX
+            .lock()
+            .map_err(|_: PoisonError<_>| Error::UNEXPECTED_FILE_MUTEX_POISONED)?;
 
         if let Some(fd) = get_fd() {
             return Ok(fd);
@@ -167,30 +174,4 @@ fn map_io_error(err: io::Error) -> Error {
                 _ => Error::ERRNO_NOT_POSITIVE,
             }
         })
-}
-
-struct Mutex(UnsafeCell<libc::pthread_mutex_t>);
-
-impl Mutex {
-    const fn new() -> Self {
-        Self(UnsafeCell::new(libc::PTHREAD_MUTEX_INITIALIZER))
-    }
-    unsafe fn lock(&self) {
-        let r = libc::pthread_mutex_lock(self.0.get());
-        debug_assert_eq!(r, 0);
-    }
-    unsafe fn unlock(&self) {
-        let r = libc::pthread_mutex_unlock(self.0.get());
-        debug_assert_eq!(r, 0);
-    }
-}
-
-unsafe impl Sync for Mutex {}
-
-struct DropGuard<F: FnMut()>(F);
-
-impl<F: FnMut()> Drop for DropGuard<F> {
-    fn drop(&mut self) {
-        self.0()
-    }
 }
