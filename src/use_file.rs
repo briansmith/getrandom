@@ -6,14 +6,12 @@ use crate::{util_libc::sys_fill_exact, Error};
 use core::{
     ffi::c_void,
     mem::MaybeUninit,
-    sync::atomic::{AtomicI32, Ordering},
 };
 use std::{
-    fs,
+    fs::File,
     io,
-    // TODO(MSRV 1.66): use `std::os::fd` instead of `std::unix::io`.
-    os::unix::io::{AsRawFd as _, BorrowedFd, IntoRawFd as _, RawFd},
-    sync::{Mutex, PoisonError},
+    os::unix::io::{AsRawFd as _},
+    sync::{RwLock, PoisonError},
 };
 
 /// For all platforms, we use `/dev/urandom` rather than `/dev/random`.
@@ -28,26 +26,6 @@ const FILE_PATH: &str = "/dev/urandom";
 // `#[cold]` because it is hot when it is actually used.
 #[cfg_attr(any(target_os = "android", target_os = "linux"), inline(never))]
 pub fn getrandom_inner(dest: &mut [MaybeUninit<u8>]) -> Result<(), Error> {
-    let fd = get_rng_fd()?;
-    sys_fill_exact(dest, |buf| unsafe {
-        libc::read(fd.as_raw_fd(), buf.as_mut_ptr().cast::<c_void>(), buf.len())
-    })
-}
-
-// Returns the file descriptor for the device file used to retrieve random
-// bytes. The file will be opened exactly once. All subsequent calls will
-// return the same file descriptor. This file descriptor is never closed.
-fn get_rng_fd() -> Result<BorrowedFd<'static>, Error> {
-    // std::os::fd::{BorrowedFd, OwnedFd} guarantee that -1 is not a valid file descriptor.
-    const FD_UNINIT: RawFd = -1;
-
-    // In theory `RawFd` could be something other than `i32`, but for the
-    // targets we currently support that use `use_file`, it is always `i32`.
-    // If/when we add support for a target where that isn't the case, we may
-    // need to use a different atomic type or make other accomodations. The
-    // compiler will let us know if/when that is the case, because the
-    // `FD.store(fd)` would fail to compile.
-    //
     // The opening of the file, by libc/libstd/etc. may write some unknown
     // state into in-process memory. (Such state may include some sanitizer
     // bookkeeping, or we might be operating in a unikernal-like environment
@@ -55,55 +33,46 @@ fn get_rng_fd() -> Result<BorrowedFd<'static>, Error> {
     // process.) `get_fd_locked` stores into FD using `Ordering::Release` to
     // ensure any such state is synchronized. `get_fd` loads from `FD` with
     // `Ordering::Acquire` to synchronize with it.
-    static FD: AtomicI32 = AtomicI32::new(FD_UNINIT);
-
-    fn get_fd() -> Option<BorrowedFd<'static>> {
-        match FD.load(Ordering::Acquire) {
-            FD_UNINIT => None,
-            val => Some(unsafe { BorrowedFd::borrow_raw(val) }),
+    //
+    // This lock is used to prevent multiple threads from opening file
+    // descriptors concurrently, which could run into the limit on the
+    // number of open file descriptors. Our goal is to have no more than one
+    // file descriptor open, ever.
+    //
+    // We assume any call to `RwLock::read` synchronizes-with
+    // (Ordering::Acquire) the preceding dropping of a `RwLockWriteGuard` that
+    // unlocks the lock (Ordering::Release). See
+    // `https://github.com/rust-lang/rust/issues/126239.
+    //
+    // TODO(MSRV feature(once_cell_try)): Use `OnceLock::get_or_try_init()` instead.
+    static FILE: RwLock<Option<File>> = RwLock::new(None);
+    loop {
+        {
+            let r = FILE.read()
+                .map_err(|_: PoisonError<_>| Error::UNEXPECTED_FILE_MUTEX_POISONED)?;
+            if let Some(file) = r.as_ref() {
+                // TODO(MSRV feature(read_buf)): Use `std::io::Read::read_buf`
+                return sys_fill_exact(dest, |buf| unsafe {
+                    libc::read(file.as_raw_fd(), buf.as_mut_ptr().cast::<c_void>(), buf.len())
+                });
+            }
         }
+        init(&FILE)?;
     }
+}
 
-    #[cold]
-    fn get_fd_locked() -> Result<BorrowedFd<'static>, Error> {
-        // This mutex is used to prevent multiple threads from opening file
-        // descriptors concurrently, which could run into the limit on the
-        // number of open file descriptors. Our goal is to have no more than one
-        // file descriptor open, ever.
-        //
-        // We assume any call to `Mutex::lock` synchronizes-with
-        // (Ordering::Acquire) the preceding dropping of a `MutexGuard` that
-        // unlocks the mutex (Ordering::Release) and that `Mutex` doesn't have
-        // any special treatment for what's "inside" the mutex (the `T` in
-        // `Mutex<T>`). See `https://github.com/rust-lang/rust/issues/126239.
-        static MUTEX: Mutex<()> = Mutex::new(());
-        let _guard = MUTEX
-            .lock()
-            .map_err(|_: PoisonError<_>| Error::UNEXPECTED_FILE_MUTEX_POISONED)?;
-
-        if let Some(fd) = get_fd() {
-            return Ok(fd);
-        }
-
+#[cold]
+fn init(file: &RwLock<Option<File>>) -> Result<(), Error> {
+    let mut w = file.write()
+        .map_err(|_: PoisonError<_>| Error::UNEXPECTED_FILE_MUTEX_POISONED)?;
+    if w.is_none() {
         // On Linux, /dev/urandom might return insecure values.
         #[cfg(any(target_os = "android", target_os = "linux"))]
         wait_until_rng_ready()?;
 
-        let file = fs::File::open(FILE_PATH).map_err(map_io_error)?;
-
-        let fd = file.into_raw_fd();
-        debug_assert!(fd != FD_UNINIT);
-        FD.store(fd, Ordering::Release);
-
-        Ok(unsafe { BorrowedFd::borrow_raw(fd) })
+        *w = Some(File::open(FILE_PATH).map_err(map_io_error)?);
     }
-
-    // Use double-checked locking to avoid acquiring the lock if possible.
-    if let Some(fd) = get_fd() {
-        Ok(fd)
-    } else {
-        get_fd_locked()
-    }
+    Ok(())
 }
 
 // Polls /dev/random to make sure it is ok to read from /dev/urandom.
@@ -136,7 +105,7 @@ fn get_rng_fd() -> Result<BorrowedFd<'static>, Error> {
 // libsodium uses `libc::poll` similarly to this.
 #[cfg(any(target_os = "android", target_os = "linux"))]
 fn wait_until_rng_ready() -> Result<(), Error> {
-    let file = fs::File::open("/dev/random").map_err(map_io_error)?;
+    let file = File::open("/dev/random").map_err(map_io_error)?;
     let mut pfd = libc::pollfd {
         fd: file.as_raw_fd(),
         events: libc::POLLIN,
